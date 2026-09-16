@@ -2611,36 +2611,45 @@ app.get('/ghl/provider/config', (req, res) => {
  * @returns {Promise<Buffer>} - Media file buffer
  */
 async function downloadGHLMedia(mediaUrl, accessToken) {
-  try {
-    console.log(`📥 Downloading media from GHL: ${mediaUrl}`);
+// GHL now returns public signed URLs (usercontent.site / GCS).
+// Sending an Authorization header to GCS causes 401, so try without auth first.
+try {
+console.log(`📥 Downloading media from GHL (no auth): ${mediaUrl}`);
+const response = await axios.get(mediaUrl, {
+responseType: 'arraybuffer',
+headers: {
+'User-Agent': 'WhatsApp-Bridge/1.0',
+'Accept': '*/*'
+},
+timeout: 60000
+});
+console.log(`✅ Downloaded ${response.data.byteLength} bytes (no auth)`);
+return Buffer.from(response.data);
+} catch (noAuthError) {
+console.log(`⚠️ Public download failed (${noAuthError.response?.status || noAuthError.message}), retrying with auth...`);
+}
 
-    // Use proper GHL headers with Version (required for GHL API)
-    const response = await axios.get(mediaUrl, {
-      responseType: 'arraybuffer',
-      headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'Version': '2021-07-28', // GHL API version - required
-        'User-Agent': 'WhatsApp-Bridge/1.0',
-        'Accept': '*/*',
-        'Referer': 'https://app.leadconnectorhq.com/'
-      },
-      timeout: 60000 // 60 second timeout for large files
-    });
-
-    console.log(`✅ Downloaded ${response.data.byteLength} bytes from GHL`);
-    return Buffer.from(response.data);
-
-  } catch (error) {
-    console.error('❌ Failed to download GHL media:', error.message);
-    console.error('   Status:', error.response?.status);
-    console.error('   URL:', mediaUrl);
-
-    if (error.response?.status === 401) {
-      console.error('   ⚠️ GHL media URL requires authorization - token may be invalid or URL expired');
-    }
-
-    throw new Error(`GHL media download failed: ${error.message}`);
-  }
+// Fallback for older GHL media URLs that do require auth
+try {
+const response = await axios.get(mediaUrl, {
+responseType: 'arraybuffer',
+headers: {
+'Authorization': `Bearer ${accessToken}`,
+'Version': '2021-07-28',
+'User-Agent': 'WhatsApp-Bridge/1.0',
+'Accept': '*/*',
+'Referer': 'https://app.leadconnectorhq.com/'
+},
+timeout: 60000
+});
+console.log(`✅ Downloaded ${response.data.byteLength} bytes (with auth)`);
+return Buffer.from(response.data);
+} catch (error) {
+console.error('❌ Failed to download GHL media:', error.message);
+console.error('   Status:', error.response?.status);
+console.error('   URL:', mediaUrl);
+throw new Error(`GHL media download failed: ${error.message}`);
+}
 }
 
 /**
