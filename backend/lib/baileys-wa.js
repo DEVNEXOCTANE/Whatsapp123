@@ -355,10 +355,14 @@ class BaileysWhatsAppManager {
         printQRInTerminal: false,
         // Removed msgRetryCounterCache - let Baileys use its default cache implementation
         // This prevents "msgRetryCache.del is not a function" error
+        // Baileys calls this when WhatsApp asks us to re-send a message
+        // (retry receipt). Returning a placeholder made us send
+        // 'Hello from Octendr!' in place of the real content — users saw this
+        // instead of their actual message or file. We keep no message store,
+        // so the honest answer is undefined: Baileys then skips the retry
+        // rather than delivering wrong content.
         getMessage: async (key) => {
-          return {
-            conversation: 'Hello from Octendr!'
-          };
+          return undefined;
         },
         shouldSyncHistoryMessage: () => true,
         shouldIgnoreJid: () => false,
