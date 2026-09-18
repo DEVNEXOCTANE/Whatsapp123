@@ -17,12 +17,12 @@ const cookieParser = require('cookie-parser');
 const { createClient } = require('@supabase/supabase-js');
 const GHLClient = require('./lib/ghl');
 const qrcode = require('qrcode');
-const { processWhatsAppMedia, uploadMediaToGHL } = require('./mediaHandler');
+const { uploadMediaToGHL } = require('./mediaHandler');
 const axios = require('axios');
 const Stripe = require('stripe');
 const rateLimit = require('express-rate-limit');
 // Import Baileys functions for media decryption
-const { downloadMediaMessage, downloadContentFromMessage } = require('@whiskeysockets/baileys');
+const { downloadMediaMessage } = require('@whiskeysockets/baileys');
 // Import subaccount helpers
 const subaccountHelpers = require('./lib/subaccount-helpers');
 // Import drip queue processor (already instantiated)
@@ -30,6 +30,14 @@ const dripQueueProcessor = require('./lib/drip-queue-processor');
 
 // Global GHL Configuration
 const BASE = "https://services.leadconnectorhq.com";
+
+// Canonical WhatsApp client key format. Every create/lookup/disconnect must go through
+// this helper so the format can never drift between call sites again.
+function buildClientKey(subaccountId, sessionId) {
+  const cleanSub = String(subaccountId).replace(/[^a-zA-Z0-9_-]/g, '_');
+  const cleanSess = String(sessionId).replace(/[^a-zA-Z0-9_-]/g, '_');
+  return `location_${cleanSub}_${cleanSess}`;
+}
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -75,15 +83,56 @@ const STRIPE_STARTER_PRICE_ID = process.env.STRIPE_STARTER_PRICE_ID;
 const STRIPE_PROFESSIONAL_PRICE_ID = process.env.STRIPE_PROFESSIONAL_PRICE_ID;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 
+// Terminal error: the refresh token is permanently invalid and the user must re-authorize.
+// Never retry on this - retrying an invalid_grant can never succeed.
+class GHLReauthRequiredError extends Error {
+  constructor(accountId) {
+    super(`GHL account ${accountId} requires re-authorization`);
+    this.name = 'GHLReauthRequiredError';
+    this.accountId = accountId;
+  }
+}
+
+// GHL refresh tokens ROTATE and are ONE-TIME USE: two concurrent refreshes for the same
+// account guarantee the second gets invalid_grant, which permanently breaks the account.
+// This map ensures only one refresh is ever in flight per account id.
+const refreshInFlight = new Map();
+
 // Token refresh function
 async function refreshGHLToken(ghlAccount) {
+  if (refreshInFlight.has(ghlAccount.id)) {
+    console.log(`⏳ Refresh already in flight for ${ghlAccount.id}, awaiting it`);
+    return refreshInFlight.get(ghlAccount.id);
+  }
+  const p = doRefreshGHLToken(ghlAccount).finally(() => refreshInFlight.delete(ghlAccount.id));
+  refreshInFlight.set(ghlAccount.id, p);
+  return p;
+}
+
+async function doRefreshGHLToken(ghlAccount) {
   try {
     console.log(`🔄 Refreshing token for GHL account: ${ghlAccount.id}`);
-    console.log(`🔑 Using refresh token: ${ghlAccount.refresh_token ? 'Present' : 'Missing'}`);
+
+    // Always re-read the row: the in-memory object may carry a refresh token that a
+    // previous rotation already consumed, which would hard-fail with invalid_grant.
+    const { data: fresh } = await supabaseAdmin
+      .from('ghl_accounts')
+      .select('*')
+      .eq('id', ghlAccount.id)
+      .single();
+
+    if (fresh?.needs_reauth === true) {
+      console.log(`🚫 GHL account ${ghlAccount.id} is flagged needs_reauth - skipping refresh`);
+      throw new GHLReauthRequiredError(ghlAccount.id);
+    }
+
+    const currentRefreshToken = fresh?.refresh_token || ghlAccount.refresh_token;
+
+    console.log(`🔑 Using refresh token: ${currentRefreshToken ? 'Present' : 'Missing'}`);
     console.log(`🔑 Client ID: ${GHL_CLIENT_ID ? 'Present' : 'Missing'}`);
     console.log(`🔑 Client Secret: ${GHL_CLIENT_SECRET ? 'Present' : 'Missing'}`);
 
-    if (!ghlAccount.refresh_token) {
+    if (!currentRefreshToken) {
       throw new Error('No refresh token available');
     }
 
@@ -94,7 +143,7 @@ async function refreshGHLToken(ghlAccount) {
     // GHL OAuth requires form-urlencoded format
     const formData = new URLSearchParams();
     formData.append('grant_type', 'refresh_token');
-    formData.append('refresh_token', ghlAccount.refresh_token);
+    formData.append('refresh_token', currentRefreshToken);
     formData.append('client_id', GHL_CLIENT_ID);
     formData.append('client_secret', GHL_CLIENT_SECRET);
 
@@ -111,6 +160,18 @@ async function refreshGHLToken(ghlAccount) {
     if (!response.ok) {
       const errorText = await response.text();
       console.error(`❌ Token refresh failed: ${response.status} - ${errorText}`);
+
+      // invalid_grant is TERMINAL - the refresh token is gone for good and retrying
+      // never helps. Flag the account so nothing else keeps hammering it.
+      if (response.status === 400 && errorText && errorText.includes('invalid_grant')) {
+        console.error(`🚫 Refresh token permanently invalid for ${ghlAccount.id} — marking needs_reauth`);
+        await supabaseAdmin
+          .from('ghl_accounts')
+          .update({ needs_reauth: true })
+          .eq('id', ghlAccount.id);
+        throw new GHLReauthRequiredError(ghlAccount.id);
+      }
+
       throw new Error(`Token refresh failed: ${response.status} - ${errorText}`);
     }
 
@@ -155,21 +216,16 @@ function getMediaMessageText(messageType) {
   return messages[messageType] || '📎 Media received';
 }
 
-// Helper function to get media file extension
-function getMediaExtension(messageType) {
-  switch (messageType) {
-    case 'image': return 'jpg';
-    case 'voice': return 'ogg';
-    case 'video': return 'mp4';
-    case 'audio': return 'mp3';
-    case 'document': return 'pdf';
-    default: return 'bin';
-  }
-}
-
 // Check and refresh token if needed
 async function ensureValidToken(ghlAccount, forceRefresh = false) {
   try {
+    // Account already known to need re-authorization - never attempt a refresh,
+    // it can only fail and add noise.
+    if (ghlAccount.needs_reauth === true) {
+      console.log(`🚫 GHL account ${ghlAccount.id} needs re-authorization - using stored token without refresh`);
+      return ghlAccount.access_token;
+    }
+
     if (forceRefresh) {
       console.log(`🔄 Force refreshing token for GHL account ${ghlAccount.id}`);
       return await refreshGHLToken(ghlAccount);
@@ -207,8 +263,17 @@ async function makeGHLRequest(url, options, ghlAccount, retryCount = 0) {
     if (response.status === 401 && retryCount < MAX_RETRIES) {
       console.log(`🔄 Got 401 error, refreshing token and retrying... (attempt ${retryCount + 1}/${MAX_RETRIES})`);
 
-      // Refresh token
-      const newToken = await refreshGHLToken(ghlAccount);
+      // Refresh token - if the refresh token is permanently dead, retrying is pointless
+      let newToken;
+      try {
+        newToken = await refreshGHLToken(ghlAccount);
+      } catch (refreshError) {
+        if (refreshError instanceof GHLReauthRequiredError) {
+          console.error(`🚫 Not retrying request - GHL account ${ghlAccount.id} requires re-authorization`);
+          return response;
+        }
+        throw refreshError;
+      }
 
       // Update authorization header with new token
       options.headers.Authorization = `Bearer ${newToken}`;
@@ -243,7 +308,7 @@ const waManager = new BaileysWhatsAppManager();
 const { hashPassword, verifyPassword, generateOTP } = require('./lib/password');
 const emailService = require('./lib/email');
 
-// Scheduled token refresh (every 6 hours - more frequent for 24-hour tokens)
+// Scheduled token refresh (every 4 hours - tokens last 24h, refresh tokens are one-time use)
 setInterval(async () => {
   try {
     console.log('🔄 Running scheduled token refresh...');
@@ -258,60 +323,38 @@ setInterval(async () => {
       return;
     }
 
-    console.log(`📋 Found ${ghlAccounts.length} GHL accounts to check for token refresh`);
+    // Only touch accounts that actually need it soon - refreshing early burns a
+    // one-time-use refresh token for nothing.
+    const sixHoursFromNow = new Date(Date.now() + (6 * 60 * 60 * 1000));
+    const dueAccounts = ghlAccounts.filter(account => {
+      if (account.needs_reauth === true) {
+        return false;
+      }
+      if (!account.token_expires_at) {
+        return true;
+      }
+      return new Date(account.token_expires_at) <= sixHoursFromNow;
+    });
 
-    for (const account of ghlAccounts) {
+    console.log(`📋 Found ${dueAccounts.length} GHL accounts due for token refresh (of ${ghlAccounts.length} total)`);
+
+    for (const account of dueAccounts) {
       try {
         await ensureValidToken(account);
         console.log(`✅ Token check completed for GHL account: ${account.id}`);
       } catch (error) {
         console.error(`❌ Token refresh failed for GHL account ${account.id}:`, error);
       }
+
+      // Stagger refreshes so two rotations are never simultaneous
+      await new Promise(r => setTimeout(r, 1500));
     }
 
     console.log('✅ Scheduled token refresh completed');
   } catch (error) {
     console.error('❌ Scheduled token refresh error:', error);
   }
-}, 6 * 60 * 60 * 1000); // Every 6 hours
-
-// Additional aggressive token refresh (every 2 hours for critical accounts)
-setInterval(async () => {
-  try {
-    console.log('🔄 Running aggressive token refresh...');
-
-    const { data: ghlAccounts } = await supabaseAdmin
-      .from('ghl_accounts')
-      .select('*')
-      .not('refresh_token', 'is', null);
-
-    if (!ghlAccounts || ghlAccounts.length === 0) {
-      return;
-    }
-
-    for (const account of ghlAccounts) {
-      try {
-        // Check if token expires within 8 hours
-        const now = new Date();
-        const expiresAt = account.token_expires_at ? new Date(account.token_expires_at) : new Date(0);
-        const eightHoursFromNow = new Date(now.getTime() + (8 * 60 * 60 * 1000));
-
-        if (expiresAt <= eightHoursFromNow) {
-          if (account.token_expires_at) {
-            console.log(`🔄 Aggressive refresh for account ${account.id} (expires in ${Math.round((expiresAt - now) / (60 * 60 * 1000))} hours)`);
-          } else {
-            console.log(`🔄 Aggressive refresh for account ${account.id} (no expiration date found, forcing refresh)`);
-          }
-          await refreshGHLToken(account);
-        }
-      } catch (error) {
-        console.error(`❌ Aggressive token refresh failed for GHL account ${account.id}:`, error);
-      }
-    }
-  } catch (error) {
-    console.error('❌ Aggressive token refresh error:', error);
-  }
-}, 2 * 60 * 60 * 1000); // Every 2 hours
+}, 4 * 60 * 60 * 1000); // Every 4 hours
 
 // Restore WhatsApp clients from database on startup
 async function restoreWhatsAppClients() {
@@ -338,8 +381,7 @@ async function restoreWhatsAppClients() {
 
     for (const session of sessions) {
       try {
-        const cleanSubaccountId = session.subaccount_id.replace(/[^a-zA-Z0-9_-]/g, '_');
-        const sessionName = `location_${cleanSubaccountId}_${session.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+        const sessionName = buildClientKey(session.subaccount_id, session.id);
 
         console.log(`🔄 Restoring client for session: ${sessionName}`);
         await waManager.createClient(sessionName);
@@ -786,7 +828,7 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
                     for (const session of sessions) {
                       try {
                         // Disconnect WhatsApp client
-                        const sessionName = `subaccount_${ghlAccount.id}_${session.id}`;
+                        const sessionName = buildClientKey(ghlAccount.id, session.id);
                         await waManager.disconnectClient(sessionName);
                         waManager.clearSessionData(sessionName);
 
@@ -1200,6 +1242,34 @@ const requireAuth = async (req, res, next) => {
   }
 };
 
+// Admin/debug endpoint protection - shared secret via x-admin-secret header
+const requireAdminSecret = (req, res, next) => {
+  const adminSecret = req.headers['x-admin-secret'];
+  if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+};
+
+// Webhook protection for endpoints called by GHL workflows (cannot use requireAuth).
+// If WEBHOOK_SECRET is not configured we warn once at startup and allow through so
+// existing installs keep working; when it IS configured it is enforced.
+const requireWebhookSecret = (req, res, next) => {
+  const configuredSecret = process.env.WEBHOOK_SECRET;
+  if (!configuredSecret) {
+    return next();
+  }
+  const providedSecret = req.headers['x-octendr-secret'];
+  if (!providedSecret || providedSecret !== configuredSecret) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+};
+
+if (!process.env.WEBHOOK_SECRET) {
+  console.warn('⚠️ WEBHOOK_SECRET is not set - webhook endpoints (/api/team-notification, /webhooks/ghl/action-execute, /whatsapp/webhook) are UNAUTHENTICATED. Set WEBHOOK_SECRET to enforce the x-octendr-secret header.');
+}
+
 // Health check
 // Health check endpoints for monitoring
 app.get('/api/health/database', requireAuth, async (req, res) => {
@@ -1551,7 +1621,7 @@ app.get('/oauth/callback', async (req, res) => {
     // 1. Get user subscription info
     const { data: userInfo, error: userInfoError } = await supabaseAdmin
       .from('users')
-      .select('subscription_status, max_subaccounts, total_subaccounts, email, trial_ends_at')
+      .select('subscription_status, max_subaccounts, total_subaccounts, email, trial_ends_at, subscription_ends_at')
       .eq('id', targetUserId)
       .single();
 
@@ -2285,7 +2355,7 @@ app.post('/admin/create-session', requireAuth, async (req, res) => {
     console.log(`✅ Session created with ID: ${session.id}, mode: ${mode}`);
 
     // Start WhatsApp client creation for QR mode
-    const sessionName = `subaccount_${subaccountId}_${session.id}`;
+    const sessionName = buildClientKey(subaccountId, session.id);
 
     try {
       await waManager.createClient(sessionName);
@@ -2909,8 +2979,7 @@ app.post('/ghl/provider/webhook', async (req, res) => {
     }
 
     // Get WhatsApp client using Baileys
-    const cleanSubaccountId = session.subaccount_id.replace(/[^a-zA-Z0-9_-]/g, '_');
-    const clientKey = `location_${cleanSubaccountId}_${session.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+    const clientKey = buildClientKey(session.subaccount_id, session.id);
 
     console.log(`🔍 Webhook Debug - Session ID: ${session.id}`);
     console.log(`🔍 Webhook Debug - Subaccount ID: ${session.subaccount_id}`);
@@ -3008,31 +3077,6 @@ app.post('/ghl/provider/webhook', async (req, res) => {
     console.log(`📱 Webhook Debug - Message Text: "${messageText}"`);
     console.log(`📱 Webhook Debug - Message ID: ${messageId}`);
     console.log(`📱 Webhook Debug - Client Key: ${clientKey}`);
-
-    // Check if this message was just received from WhatsApp (prevent echo)
-    const recentMessageKey = `whatsapp_${phoneNumber}_${messageText}`;
-    if (global.recentMessages && global.recentMessages.has(recentMessageKey)) {
-      return res.json({ status: 'success', reason: 'echo_prevented' });
-    }
-
-    // Simple echo prevention
-    const messageContent = messageText.toLowerCase().trim();
-    const recentMessages = global.recentMessages || new Set();
-    let isRecentEcho = false;
-
-    for (const key of recentMessages) {
-      if (key.startsWith(`whatsapp_${phoneNumber}_`)) {
-        const recentContent = key.split('_').slice(2).join('_').toLowerCase().trim();
-        if (recentContent === messageContent) {
-          isRecentEcho = true;
-          break;
-        }
-      }
-    }
-
-    if (isRecentEcho) {
-      return res.json({ status: 'success', reason: 'echo_prevented' });
-    }
 
     // Process and send message (text and/or media)
     try {
@@ -3352,13 +3396,6 @@ app.post('/ghl/provider/webhook', async (req, res) => {
   }
 });
 
-// Global GHL Configuration
-const HEADERS = {
-  Authorization: `Bearer ${process.env.GHL_LOCATION_API_KEY}`,
-  Version: "2021-07-28",
-  "Content-Type": "application/json",
-};
-
 // Provider ID is now loaded from environment variables
 
 // Validate environment variables on startup (optional)
@@ -3432,21 +3469,9 @@ async function processIncomingWhatsAppMessage(payload) {
       }
     }
 
-    // Final fallback to any GHL account if still not found
     if (!ghlAccount) {
-      const { data: anyAccount } = await supabaseAdmin
-        .from('ghl_accounts')
-        .select('*')
-        .limit(1)
-        .maybeSingle();
-
-      if (anyAccount) {
-        ghlAccount = anyAccount;
-      }
-    }
-
-    if (!ghlAccount) {
-      return { status: 'success' };
+      console.error(`❌ No GHL account resolved for session ${sessionId} — refusing to route message`);
+      return { status: 'error', reason: 'no_ghl_account_resolved' };
     }
 
     const locationId = ghlAccount.location_id;
@@ -3932,7 +3957,7 @@ async function processIncomingWhatsAppMessage(payload) {
   }
 }
 
-app.post('/whatsapp/webhook', async (req, res) => {
+app.post('/whatsapp/webhook', requireWebhookSecret, async (req, res) => {
   try {
     const result = await processIncomingWhatsAppMessage(req.body);
     res.json(result || { status: 'ok' });
@@ -3947,7 +3972,7 @@ module.exports.processIncomingWhatsAppMessage = processIncomingWhatsAppMessage;
 // GHL Provider Send Message (Legacy endpoint - keep for compatibility)
 app.post('/ghl/provider/send', async (req, res) => {
   try {
-    const { to, message, locationId } = req.body;
+    const { to, message, text, messageType, mediaUrl, locationId } = req.body;
     console.log('GHL Send Message:', { to, message, locationId });
 
     // Find session for this location
@@ -3976,8 +4001,7 @@ app.post('/ghl/provider/send', async (req, res) => {
     }
 
     // Send message via WhatsApp - use consistent key format
-    const cleanSubaccountId = session.subaccount_id.replace(/[^a-zA-Z0-9_-]/g, '_');
-    const clientKey = `location_${cleanSubaccountId}_${session.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+    const clientKey = buildClientKey(session.subaccount_id, session.id);
 
     console.log(`🔍 Looking for WhatsApp client with key: ${clientKey}`);
     const clientStatus = waManager.getClientStatus(clientKey);
@@ -4957,7 +4981,7 @@ app.post('/ghl/location/:locationId/session', async (req, res) => {
 
     console.log(`Creating session for locationId: ${locationId}`);
 
-    // Find GHL account - try by location_id first, then fallback to any account
+    // Find GHL account - must match this location_id exactly (no cross-tenant fallback)
     let ghlAccount = null;
 
     // First try to find account with matching location_id
@@ -4970,23 +4994,11 @@ app.post('/ghl/location/:locationId/session', async (req, res) => {
     if (accountByLocation) {
       ghlAccount = accountByLocation;
       console.log('Found GHL account by location_id:', locationId);
-    } else {
-      // Fallback: use any GHL account if location_id doesn't match
-      const { data: anyAccount } = await supabaseAdmin
-        .from('ghl_accounts')
-        .select('*')
-        .limit(1)
-        .maybeSingle();
-
-      if (anyAccount) {
-        ghlAccount = anyAccount;
-        console.log('Using fallback GHL account for location:', locationId);
-      }
     }
 
     if (!ghlAccount) {
-      console.error(`No GHL account found in database`);
-      return res.status(404).json({ error: 'GHL account not found. Please connect GHL account first.' });
+      console.error(`No GHL account found for location: ${locationId}`);
+      return res.status(404).json({ error: 'GHL account not found for this location' });
     }
 
     console.log('Using GHL account:', { id: ghlAccount.id, user_id: ghlAccount.user_id, company_id: ghlAccount.company_id, location_id: ghlAccount.location_id });
@@ -5008,8 +5020,7 @@ app.post('/ghl/location/:locationId/session', async (req, res) => {
 
       // If session exists but not connected, try to restore the client
       if (existing[0].status === 'ready' || existing[0].status === 'qr') {
-        const cleanSubaccountId = existing[0].subaccount_id.replace(/[^a-zA-Z0-9_-]/g, '_');
-        const sessionName = `location_${cleanSubaccountId}_${existing[0].id.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+        const sessionName = buildClientKey(existing[0].subaccount_id, existing[0].id);
 
         console.log(`🔄 Attempting to restore client for existing session: ${sessionName}`);
 
@@ -5069,8 +5080,7 @@ app.post('/ghl/location/:locationId/session', async (req, res) => {
     }
 
     // Create WhatsApp client with subaccount-specific session name (clean format)
-    const cleanSubaccountId = session.subaccount_id.replace(/[^a-zA-Z0-9_-]/g, '_');
-    const sessionName = `location_${cleanSubaccountId}_${session.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+    const sessionName = buildClientKey(session.subaccount_id, session.id);
 
     // Add timeout for WhatsApp client initialization
     const initTimeout = setTimeout(async () => {
@@ -5206,7 +5216,7 @@ app.get('/ghl/location/:locationId/session', async (req, res) => {
   try {
     const { locationId } = req.params;
 
-    // Find GHL account for this location first (try by location_id, then fallback)
+    // Find GHL account for this location (must match location_id exactly - no cross-tenant fallback)
     let ghlAccount = null;
 
     const { data: accountByLocation } = await supabaseAdmin
@@ -5217,17 +5227,6 @@ app.get('/ghl/location/:locationId/session', async (req, res) => {
 
     if (accountByLocation) {
       ghlAccount = accountByLocation;
-    } else {
-      // Fallback: use any GHL account
-      const { data: anyAccount } = await supabaseAdmin
-        .from('ghl_accounts')
-        .select('id, user_id')
-        .limit(1)
-        .maybeSingle();
-
-      if (anyAccount) {
-        ghlAccount = anyAccount;
-      }
     }
 
     if (!ghlAccount) {
@@ -5255,7 +5254,7 @@ app.get('/ghl/location/:locationId/session', async (req, res) => {
 });
 
 // Logout session (disconnect WhatsApp)
-app.post('/ghl/location/:locationId/session/logout', async (req, res) => {
+app.post('/ghl/location/:locationId/session/logout', requireAuth, async (req, res) => {
   try {
     const { locationId } = req.params;
 
@@ -5267,6 +5266,10 @@ app.post('/ghl/location/:locationId/session/logout', async (req, res) => {
 
     if (!ghlAccount) {
       return res.status(404).json({ error: 'GHL account not found' });
+    }
+
+    if (ghlAccount.user_id !== req.user.id) {
+      return res.status(403).json({ error: 'You do not have permission for this location' });
     }
 
     const { data: session } = await supabaseAdmin
@@ -5282,8 +5285,7 @@ app.post('/ghl/location/:locationId/session/logout', async (req, res) => {
     }
 
     // Disconnect WhatsApp client FIRST (this will logout from mobile)
-    const cleanSubaccountId = ghlAccount.id.replace(/[^a-zA-Z0-9_-]/g, '_');
-    const sessionName = `location_${cleanSubaccountId}_${session.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+    const sessionName = buildClientKey(ghlAccount.id, session.id);
 
     console.log(`🔌 Disconnecting WhatsApp session: ${sessionName}`);
 
@@ -5341,7 +5343,7 @@ app.post('/ghl/location/:locationId/session/logout', async (req, res) => {
 });
 
 // Reset Session (Delete session from database)
-app.post('/ghl/location/:locationId/session/reset', async (req, res) => {
+app.post('/ghl/location/:locationId/session/reset', requireAuth, async (req, res) => {
   try {
     const { locationId } = req.params;
 
@@ -5353,6 +5355,10 @@ app.post('/ghl/location/:locationId/session/reset', async (req, res) => {
 
     if (!ghlAccount) {
       return res.status(404).json({ error: 'GHL account not found' });
+    }
+
+    if (ghlAccount.user_id !== req.user.id) {
+      return res.status(403).json({ error: 'You do not have permission for this location' });
     }
 
     // Get all sessions for this subaccount
@@ -5368,11 +5374,8 @@ app.post('/ghl/location/:locationId/session/reset', async (req, res) => {
       for (const session of sessions) {
         try {
           // Try both session name formats to ensure cleanup
-          const cleanSubaccountId = ghlAccount.id.replace(/[^a-zA-Z0-9_-]/g, '_');
-          const cleanSessionId = session.id.replace(/[^a-zA-Z0-9_-]/g, '_');
-
           // Format 1: location_${subaccountId}_${sessionId}
-          const sessionName1 = `location_${cleanSubaccountId}_${cleanSessionId}`;
+          const sessionName1 = buildClientKey(ghlAccount.id, session.id);
 
           // Format 2: subaccount_${subaccountId}_${sessionId} (legacy)
           const sessionName2 = `subaccount_${ghlAccount.id}_${session.id}`;
@@ -5458,11 +5461,8 @@ app.delete('/admin/ghl/delete-subaccount', requireAuth, async (req, res) => {
       for (const session of sessions) {
         try {
           // Try both session name formats to ensure cleanup
-          const cleanSubaccountId = ghlAccount.id.replace(/[^a-zA-Z0-9_-]/g, '_');
-          const cleanSessionId = session.id.replace(/[^a-zA-Z0-9_-]/g, '_');
-
           // Format 1: location_${subaccountId}_${sessionId} (used in /ghl/location endpoints)
-          const sessionName1 = `location_${cleanSubaccountId}_${cleanSessionId}`;
+          const sessionName1 = buildClientKey(ghlAccount.id, session.id);
 
           // Format 2: subaccount_${subaccountId}_${sessionId} (legacy format)
           const sessionName2 = `subaccount_${ghlAccount.id}_${session.id}`;
@@ -5540,7 +5540,7 @@ app.delete('/admin/ghl/delete-subaccount', requireAuth, async (req, res) => {
 });
 
 // Sync all subaccounts (refresh tokens and reconnect WhatsApp)
-app.post('/admin/ghl/sync-all-subaccounts', async (req, res) => {
+app.post('/admin/ghl/sync-all-subaccounts', requireAdminSecret, async (req, res) => {
   try {
     console.log('🔄 Starting sync for all subaccounts...');
 
@@ -5566,6 +5566,18 @@ app.post('/admin/ghl/sync-all-subaccounts', async (req, res) => {
 
     for (const ghlAccount of ghlAccounts) {
       try {
+        // Skip accounts whose refresh token is permanently dead - only the user can fix these
+        if (ghlAccount.needs_reauth === true) {
+          console.log(`🚫 Skipping subaccount ${ghlAccount.location_id} - requires re-authorization`);
+          results.push({
+            locationId: ghlAccount.location_id,
+            status: 'error',
+            error: 'Requires re-authorization'
+          });
+          errorCount++;
+          continue;
+        }
+
         console.log(`🔄 Syncing subaccount: ${ghlAccount.location_id}`);
 
         // 1. Refresh token
@@ -5589,7 +5601,7 @@ app.post('/admin/ghl/sync-all-subaccounts', async (req, res) => {
         let sessionReconnected = false;
         if (sessions && sessions.length > 0) {
           const latestSession = sessions[0];
-          const sessionName = `location_${ghlAccount.id}_${latestSession.id}`;
+          const sessionName = buildClientKey(ghlAccount.id, latestSession.id);
 
           try {
             // Check current client status
@@ -5720,7 +5732,7 @@ app.post('/ghl/provider/messages', async (req, res) => {
 });
 
 // Debug endpoint to check WhatsApp clients (Baileys)
-app.get('/debug/whatsapp-clients', async (req, res) => {
+app.get('/debug/whatsapp-clients', requireAdminSecret, async (req, res) => {
   try {
     const clients = waManager.getAllClients();
     const clientInfo = clients.map(client => ({
@@ -5747,7 +5759,7 @@ app.get('/debug/whatsapp-clients', async (req, res) => {
 });
 
 // Debug endpoint to clear session data and force fresh connection
-app.post('/debug/clear-session/:sessionId', (req, res) => {
+app.post('/debug/clear-session/:sessionId', requireAdminSecret, (req, res) => {
   try {
     const { sessionId } = req.params;
     console.log(`🗑️ Clearing session data for: ${sessionId}`);
@@ -5766,7 +5778,7 @@ app.post('/debug/clear-session/:sessionId', (req, res) => {
 });
 
 // Debug endpoint to check session status
-app.get('/debug/session-status/:locationId', async (req, res) => {
+app.get('/debug/session-status/:locationId', requireAdminSecret, async (req, res) => {
   try {
     const { locationId } = req.params;
 
@@ -5798,8 +5810,7 @@ app.get('/debug/session-status/:locationId', async (req, res) => {
     }
 
     const currentSession = session[0];
-    const cleanSubaccountId = currentSession.subaccount_id.replace(/[^a-zA-Z0-9_-]/g, '_');
-    const sessionName = `location_${cleanSubaccountId}_${currentSession.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+    const sessionName = buildClientKey(currentSession.subaccount_id, currentSession.id);
 
     // Get client status
     const clientStatus = waManager.getClientStatus(sessionName);
@@ -5818,7 +5829,7 @@ app.get('/debug/session-status/:locationId', async (req, res) => {
 });
 
 // Manual token refresh endpoint
-app.post('/debug/refresh-token/:locationId', async (req, res) => {
+app.post('/debug/refresh-token/:locationId', requireAdminSecret, async (req, res) => {
   try {
     const { locationId } = req.params;
 
@@ -5850,7 +5861,7 @@ app.post('/debug/refresh-token/:locationId', async (req, res) => {
 });
 
 // Test token endpoint
-app.get('/debug/test-token/:locationId', async (req, res) => {
+app.get('/debug/test-token/:locationId', requireAdminSecret, async (req, res) => {
   try {
     const { locationId } = req.params;
 
@@ -5892,7 +5903,7 @@ app.get('/debug/test-token/:locationId', async (req, res) => {
 });
 
 // Test message sending endpoint
-app.post('/debug/send-message', async (req, res) => {
+app.post('/debug/send-message', requireAdminSecret, async (req, res) => {
   try {
     const { phoneNumber, message } = req.body;
 
@@ -5926,7 +5937,7 @@ app.post('/debug/send-message', async (req, res) => {
 });
 
 // Test incoming message webhook
-app.post('/debug/test-incoming', async (req, res) => {
+app.post('/debug/test-incoming', requireAdminSecret, async (req, res) => {
   try {
     const { from, message, locationId } = req.body;
 
@@ -5970,7 +5981,7 @@ app.post('/debug/test-incoming', async (req, res) => {
 
 
 // Emergency message sending endpoint - creates new client if needed
-app.post('/emergency/send-message', async (req, res) => {
+app.post('/emergency/send-message', requireAdminSecret, async (req, res) => {
   try {
     const { phoneNumber, message, locationId } = req.body;
 
@@ -6040,7 +6051,7 @@ app.post('/emergency/send-message', async (req, res) => {
 
 
 // Test GHL outbound webhook
-app.post('/debug/test-outbound', async (req, res) => {
+app.post('/debug/test-outbound', requireAdminSecret, async (req, res) => {
   try {
     const { contactId, text } = req.body;
 
@@ -6189,7 +6200,7 @@ app.post('/api/ghl-workflow', async (req, res) => {
 
 // GHL Marketplace Action Execute Webhook
 // This endpoint receives data when "Send via Octendr" action is triggered in GHL workflows
-app.post('/webhooks/ghl/action-execute', async (req, res) => {
+app.post('/webhooks/ghl/action-execute', requireWebhookSecret, async (req, res) => {
   try {
     console.log('🎯 GHL Marketplace Action Execute received:', JSON.stringify(req.body, null, 2));
 
@@ -6237,7 +6248,6 @@ app.post('/webhooks/ghl/action-execute', async (req, res) => {
     }
 
     // Fetch contact from GHL API to get phone number
-    const GHLClient = require('./lib/ghl');
     const ghlClient = new GHLClient(ghlAccount.access_token, locationId);
 
     let phoneNumber = null;
@@ -6302,8 +6312,7 @@ app.post('/webhooks/ghl/action-execute', async (req, res) => {
     }
 
     // Build client key
-    const cleanSubaccountId = session.subaccount_id?.replace(/[^a-zA-Z0-9_-]/g, '_') || ghlAccount.id;
-    const clientKey = `location_${cleanSubaccountId}_${session.id.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+    const clientKey = buildClientKey(session.subaccount_id || ghlAccount.id, session.id);
 
     // Check client status
     const clientStatus = waManager.getClientStatus(clientKey);
@@ -6386,7 +6395,7 @@ app.post('/webhooks/ghl/action-execute', async (req, res) => {
 });
 
 // Team notification webhook endpoint for GHL workflow
-app.post('/api/team-notification', async (req, res) => {
+app.post('/api/team-notification', requireWebhookSecret, async (req, res) => {
   try {
     console.log('🔔 Team notification webhook received:', JSON.stringify(req.body, null, 2));
 
@@ -6489,7 +6498,7 @@ app.post('/api/team-notification', async (req, res) => {
 });
 
 // Force token refresh with new scopes
-app.post('/admin/force-reauthorize/:accountId', async (req, res) => {
+app.post('/admin/force-reauthorize/:accountId', requireAdminSecret, async (req, res) => {
   try {
     const { accountId } = req.params;
 
@@ -6518,7 +6527,7 @@ app.post('/admin/force-reauthorize/:accountId', async (req, res) => {
 });
 
 // Test team notification webhook endpoint
-app.post('/api/test-team-notification', async (req, res) => {
+app.post('/api/test-team-notification', requireAdminSecret, async (req, res) => {
   try {
     console.log('🧪 Testing team notification webhook');
 
@@ -7008,7 +7017,7 @@ async function checkAndProcessExpiredSubscriptions() {
               for (const session of sessions) {
                 try {
                   // Disconnect WhatsApp client
-                  const sessionName = `subaccount_${account.id}_${session.id}`;
+                  const sessionName = buildClientKey(account.id, session.id);
                   await waManager.disconnectClient(sessionName);
                   waManager.clearSessionData(sessionName);
 
@@ -7824,8 +7833,15 @@ process.on('uncaughtException', (error) => {
   } catch(e) {
     console.error('Failed invoking email dispatch:', e.message);
   }
-  
-  // Node.js will continue running because of this handler
+
+  // After an uncaught exception the process state is unknown/corrupted - continuing to
+  // serve requests risks silently wrong behaviour (half-written DB rows, stuck sockets).
+  // Exit deliberately so the container restarts clean; the 3s delay gives the crash
+  // email above time to actually leave the process.
+  setTimeout(() => {
+    console.error('🛑 Exiting after uncaught exception to allow a clean restart');
+    process.exit(1);
+  }, 3000);
 });
 
 // Start server
